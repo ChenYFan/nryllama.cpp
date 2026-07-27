@@ -327,6 +327,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        // NarrowMoe: load secondary source (original shards) for expert tensors
+        if (params.extra_sources_glob) {
+            ml.add_extra_source(params.extra_sources_glob, params.no_mmap_prefetch);
+        }
+
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
@@ -428,6 +433,22 @@ struct llama_model * llama_model_load_from_file(
         struct llama_model_params params) {
     std::vector<std::string> splits = {};
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
+}
+
+struct llama_model * llama_model_load_from_two_sources(
+        const char * dense_path,
+        const char * shards_glob,
+        struct llama_model_params params) {
+    // hot-set (dense.part.gguf) is the primary file, offloaded to GPU per ngl;
+    // routed experts come from the original shards via add_extra_source().
+    // Keep prefetch ON globally so the dense hot-set is read sequentially (fast)
+    // into the GPU; init_mappings() disables prefetch only for the expert shards
+    // (first_extra_file), so the 238G of experts page in on demand, not at load.
+    params.partial_load       = true;
+    params.no_mmap_prefetch   = false;
+    params.extra_sources_glob = shards_glob;
+    std::vector<std::string> splits = {};
+    return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, dense_path, splits, /*file*/ nullptr, params);
 }
 
 struct llama_model * llama_model_load_from_splits(

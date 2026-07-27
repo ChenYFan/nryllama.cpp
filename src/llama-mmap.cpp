@@ -448,9 +448,25 @@ struct llama_mmap::impl {
         int flags = MAP_SHARED;
         if (numa) { prefetch = 0; }
 #ifdef __linux__
-        if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
-            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
-                    strerror(errno));
+        // NarrowMoe: when prefetch==0 (no_mmap_prefetch), tell the kernel RANDOM
+        // access so it doesn't readahead whole shards on the first page fault.
+        // Upstream unconditionally uses FADV_SEQUENTIAL which defeats prefetch=0.
+        // fadvise uses fd (ok before mmap); madvise uses addr (must be after mmap).
+        if (prefetch == 0) {
+            // NarrowMoe: use FADV_NORMAL (let kernel decide) instead of upstream's
+            // FADV_SEQUENTIAL (aggressive readahead of whole shards). FADV_RANDOM was
+            // tried but makes the hot-set upload to GPU (random page-in of 14G) crawl
+            // at ~26MB/s. NORMAL allows sequential prefetch for the hot-set read while
+            // not forcing full-shard readahead for expert access.
+            if (posix_fadvise(fd, 0, 0, POSIX_FADV_NORMAL)) {
+                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_NORMAL) failed: %s\n",
+                        strerror(errno));
+            }
+        } else {
+            if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+                LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
+                        strerror(errno));
+            }
         }
         if (prefetch) { flags |= MAP_POPULATE; }
 #endif
@@ -462,6 +478,19 @@ struct llama_mmap::impl {
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_WILLNEED) failed: %s\n",
+                        strerror(errno));
+            }
+        } else {
+            // NarrowMoe: prefetch == 0 is the expert-shard path. Experts are stored
+            // contiguously per-expert ([n_embd, n_ff_exp, n_expert], expert = outer dim),
+            // ~9.6MB each. MADV_RANDOM disables ALL readahead, so each expert access
+            // becomes ~2400 single 4K faults (measured: 16.8M faults / 79GB for a 22-tok
+            // prefill). MADV_NORMAL keeps the kernel's default readahead window so a
+            // contiguous expert reads in far fewer, larger IOs, WITHOUT MAP_POPULATE
+            // (so untouched experts are never read). This trades a little over-read at
+            // expert boundaries for a huge drop in fault count / a jump in throughput.
+            if (posix_madvise(addr, file->size(), POSIX_MADV_NORMAL)) {
+                LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_NORMAL) failed: %s\n",
                         strerror(errno));
             }
         }

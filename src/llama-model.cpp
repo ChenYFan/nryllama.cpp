@@ -1477,7 +1477,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(params.partial_load);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -1492,7 +1492,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!params.no_mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    fprintf(stderr, "[nrymoe-db] init_mappings: prefetch=%d (no_mmap_prefetch=%d) use_mmap=%d use_mlock=%d\n",
+            (int)!params.no_mmap_prefetch, (int)params.no_mmap_prefetch, (int)ml.use_mmap, (int)use_mlock);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1530,6 +1532,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+            fprintf(stderr, "[nrymoe-db] buft %s: MMAP path (host_ptr) dev=%s is_default=%d\n",
+                    ggml_backend_buft_name(buft), dev ? ggml_backend_dev_name(dev) : "null", (int)is_default_buft);
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1551,6 +1555,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf_map.emplace(idx, buf);
             }
         } else {
+            fprintf(stderr, "[nrymoe-db] buft %s: LOAD_ALL_DATA path (no mmap) use_mmap=%d use_mmap_buffer=%d host_ptr_supp=%d is_default=%d dev=%s no_alloc=%d\n",
+                    ggml_backend_buft_name(buft), (int)ml.use_mmap, (int)use_mmap_buffer,
+                    (int)buffer_from_host_ptr_supported, (int)is_default_buft,
+                    dev ? ggml_backend_dev_name(dev) : "null", (int)ml.no_alloc);
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
@@ -1619,6 +1627,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // NarrowMoe: pin the calibration-selected hot experts in RAM (mlock) — MUST be
+    // before the ml.mappings ownership move below, while ml still holds the mmaps.
+    if (params.hot_expert_manifest) {
+        ml.pin_hot_experts(params.hot_expert_manifest);
     }
 
     if (use_mmap_buffer) {
@@ -2285,6 +2299,10 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
+        /*.no_mmap_prefetch            =*/ false,
+        /*.partial_load                =*/ false,
+        /*.extra_sources_glob          =*/ nullptr,
+        /*.hot_expert_manifest         =*/ nullptr,
     };
 
     return result;

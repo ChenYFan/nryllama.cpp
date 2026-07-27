@@ -86,6 +86,12 @@ struct llama_model_loader {
 
     llama_mmaps mappings;
 
+    // NarrowMoe: index in `files` where extra expert shards begin. Files before
+    // this are the primary (dense.part) — prefetched sequentially for fast GPU
+    // upload. Files at/after this are expert shards — never prefetched (paged in
+    // on demand during inference). SIZE_MAX = no extra sources.
+    size_t first_extra_file = SIZE_MAX;
+
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
@@ -187,6 +193,17 @@ struct llama_model_loader {
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+
+    // NarrowMoe: open the original shards (shards_glob, e.g. "dir/*.gguf") as a
+    // secondary mmap'd source. Records expert tensors (names matching *_exps.*) into
+    // extra_weights; load_all_data() then binds them to a CPU buffer (paged in on demand).
+    void add_extra_source(const std::string & shards_glob, bool no_prefetch);
+
+    // NarrowMoe: mlock the hot-expert slices listed in manifest_path ("L E" lines)
+    // into RAM so they never page out. Each blk.L.ffn_{gate,up,down}_exps.weight is
+    // one [n_embd,n_ff,n_expert] tensor; expert E is a contiguous slice at
+    // (mmap base + weight.offs + E * nbytes/n_expert). Call after load_tensors.
+    void pin_hot_experts(const std::string & manifest_path);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 

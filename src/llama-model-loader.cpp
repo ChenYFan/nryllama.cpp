@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-cpp.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -11,6 +12,10 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <glob.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <cstdio>
 #include <regex>
 
 static const size_t kiB = 1024;
@@ -1336,7 +1341,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
-        for (const auto & file : files) {
+        for (size_t fi = 0; fi < files.size(); fi++) {
+            const auto & file = files[fi];
             bool is_numa = false;
 
             auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1348,7 +1354,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            // NarrowMoe: primary files (dense.part) prefetch sequentially for fast
+            // GPU upload; expert shards (fi >= first_extra_file) never prefetch —
+            // they page in on demand during inference (avoids reading 238G at load).
+            bool file_prefetch = (fi < first_extra_file) ? prefetch : false;
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), file_prefetch ? -1 : 0, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1363,6 +1374,105 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     for (const auto & it : weights_map) {
         size_data += ggml_nbytes(it.second.tensor);
     }
+}
+
+// NarrowMoe: open the original shards as additional (non-split) files and add
+// ONLY their routed-expert tensors (ffn_*_exps) into the standard weights_map /
+// files / contexts, exactly like the split-loading path. This makes experts flow
+// through the proven mmap path (init_mappings + load_all_data); combined with the
+// ffn_*_exps->CPU tensor_buft_override, experts stay on CPU and page in on demand,
+// while the dense hot-set is read from the fast dense.part.gguf and offloaded to GPU.
+void llama_model_loader::add_extra_source(const std::string & shards_glob, bool no_prefetch) {
+    (void) no_prefetch; // init_mappings() handles prefetch uniformly for all files
+    glob_t g;
+    if (glob(shards_glob.c_str(), 0, nullptr, &g) != 0) {
+        LLAMA_LOG_WARN("%s: glob '%s' matched nothing\n", __func__, shards_glob.c_str());
+        return;
+    }
+    std::vector<std::string> paths;
+    for (size_t i = 0; i < g.gl_pathc; ++i) {
+        paths.emplace_back(g.gl_pathv[i]);
+    }
+    globfree(&g);
+    std::sort(paths.begin(), paths.end());
+
+    // mark where expert shards begin so init_mappings won't prefetch them
+    if (first_extra_file == SIZE_MAX) {
+        first_extra_file = files.size();
+    }
+
+    for (const auto & path : paths) {
+        struct ggml_context * ctx = nullptr;
+        struct gguf_init_params gp { /*.no_alloc=*/true, /*.ctx=*/&ctx };
+        gguf_context_ptr up(gguf_init_from_file(path.c_str(), gp));
+        if (!up) {
+            LLAMA_LOG_WARN("%s: failed to open %s\n", __func__, path.c_str());
+            continue;
+        }
+        // register the shard as an additional file + keep its ggml ctx (tensor meta) alive
+        files.emplace_back(new llama_file(path.c_str(), "rb", use_direct_io));
+        uint16_t idx = (uint16_t) (files.size() - 1);
+        size_t n_added = 0;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            std::string name = cur->name;
+            if (name.find("_exps.") == std::string::npos) continue;   // only routed-expert tensors
+            if (weights_map.find(name) != weights_map.end()) continue; // dedup (should not happen)
+            n_elements += ggml_nelements(cur);
+            n_bytes    += ggml_nbytes(cur);
+            weights_map.emplace(name, llama_tensor_weight(files.back().get(), idx, up.get(), cur));
+            n_added++;
+        }
+        contexts.emplace_back(ctx);
+        LLAMA_LOG_INFO("%s: extra source %s (+%zu expert tensors, file idx %u)\n",
+                       __func__, path.c_str(), n_added, idx);
+        // up (gguf_context) is dropped here; llama_tensor_weight kept only the ggml ctx meta
+    }
+    // experts are now part of the model's tensor set
+    n_tensors = (int) weights_map.size();
+    LLAMA_LOG_INFO("%s: total tensors now %d (incl. experts)\n", __func__, n_tensors);
+}
+
+void llama_model_loader::pin_hot_experts(const std::string & manifest_path) {
+    FILE * f = fopen(manifest_path.c_str(), "r");
+    if (!f) {
+        LLAMA_LOG_WARN("%s: cannot open hot-expert manifest '%s' — skipping\n", __func__, manifest_path.c_str());
+        return;
+    }
+    if (mappings.empty()) {
+        LLAMA_LOG_WARN("%s: no mmap mappings (use_mmap off?) — cannot pin\n", __func__);
+        fclose(f);
+        return;
+    }
+    // best-effort: lift the memlock rlimit (root usually allows) so large pins succeed
+    struct rlimit rl = { RLIM_INFINITY, RLIM_INFINITY };
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+
+    const char * types[3] = { "gate", "up", "down" };
+    char line[256];
+    size_t pinned = 0, misses = 0;
+    size_t bytes = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') continue;
+        int il = -1, e = -1;
+        if (sscanf(line, "%d %d", &il, &e) != 2 || il < 0 || e < 0) continue;
+        for (int t = 0; t < 3; t++) {
+            char name[128];
+            snprintf(name, sizeof(name), "blk.%d.ffn_%s_exps.weight", il, types[t]);
+            auto it = weights_map.find(name);
+            if (it == weights_map.end()) { misses++; continue; }
+            const llama_tensor_weight & w = it->second;
+            const int64_t n_e = w.tensor->ne[2];      // expert dim
+            if (n_e <= 0 || e >= n_e) { misses++; continue; }
+            const size_t per = ggml_nbytes(w.tensor) / (size_t) n_e;
+            void * base = (char *) mappings.at(w.idx)->addr() + w.offs + (size_t) e * per;
+            // mlock faults the pages in from disk now and keeps them resident
+            if (mlock(base, per) == 0) { pinned++; bytes += per; }
+            else                       { misses++; }
+        }
+    }
+    fclose(f);
+    LLAMA_LOG_INFO("%s: pinned %zu expert slices (%.1f GB) in RAM (%zu misses)\n",
+                   __func__, pinned, bytes / 1e9, misses);
 }
 
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {

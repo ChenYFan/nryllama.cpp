@@ -324,6 +324,10 @@ extern "C" {
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool no_mmap_prefetch; // NarrowMoe: skip mmap readahead of full shards (only page in on demand)
+        bool partial_load;     // NarrowMoe: tolerate a GGUF that has fewer tensors than the graph creates (experts come from a second source)
+        const char * extra_sources_glob; // NarrowMoe: glob of extra GGUF shards providing expert tensors (mmap on CPU)
+        const char * hot_expert_manifest; // NarrowMoe: path to "L E" hot-expert list; those slices are mlock'd in RAM (never page out)
     };
 
     struct llama_sampler_seq_config {
@@ -500,6 +504,13 @@ extern "C" {
     LLAMA_API struct llama_model * llama_model_load_from_splits(
                              const char ** paths,
                                  size_t    n_paths,
+              struct llama_model_params    params);
+
+    // NarrowMoe: load hot-set from a dense.part.gguf (offloaded to GPU per ngl) and
+    // routed experts (ffn_*_exps) from the original shards, mmap'd on CPU on demand.
+    LLAMA_API struct llama_model * llama_model_load_from_two_sources(
+                             const char *                dense_path,
+                             const char *                shards_glob,
               struct llama_model_params    params);
 
     LLAMA_API void llama_model_save_to_file(
